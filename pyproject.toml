@@ -1,0 +1,21 @@
+[project]
+name = "personal-api"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "zsinx6", email = "zsinx6@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.165.0",
+    "google-api-python-client>=2.202.0",
+    "httpx>=0.28.1",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+personal-api = "personal_api:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
