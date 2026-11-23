@@ -1,55 +1,52 @@
-import os
-import re
-import secrets
 from datetime import datetime, timedelta, timezone
+import hmac
+import os
 from pathlib import Path
 from typing import Any
 
-import httpx
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import httpx
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / ".env"
-SERVICE_ACCOUNT_FILE = BASE_DIR / "service-account.json"
+load_dotenv(BASE_DIR / ".env")
 
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
-EVENT_ID_PATTERN = r"^[a-zA-Z0-9_-]{5,128}$"
-BOARD_ID_RE = re.compile(r"^[a-zA-Z0-9]{6,32}$")
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+EVENT_ID_PATTERN = r"^[a-zA-Z0-9_-]{5,1024}$"
 
-
-def load_local_env() -> None:
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+app = FastAPI(title="Personal Bridge API", version="1.1.0")
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
-load_local_env()
-bearer = HTTPBearer()
-
-
-def require_token(creds: HTTPAuthorizationCredentials = Security(bearer)) -> None:
-    expected = os.environ.get("PERSONAL_API_TOKEN", "")
-    if not expected or not secrets.compare_digest(creds.credentials, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-app = FastAPI(dependencies=[Depends(require_token)], docs_url=None, redoc_url=None)
+def verify_token(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+) -> None:
+    expected = (
+        os.environ.get("API_TOKEN")
+        or os.environ.get("PERSONAL_API_TOKEN")
+        or os.environ.get("BRIDGE_TOKEN")
+        or ""
+    ).strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="Server API token is not configured")
+    if credentials is None or not hmac.compare_digest(credentials.credentials, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
 def get_calendar_service():
-    if not SERVICE_ACCOUNT_FILE.exists():
-        raise HTTPException(status_code=500, detail="service-account.json is missing")
-    creds = service_account.Credentials.from_service_account_file(
-        str(SERVICE_ACCOUNT_FILE), scopes=GOOGLE_SCOPES
+    sa_path = Path(
+        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", str(BASE_DIR / "service-account.json"))
     )
+    if not sa_path.is_absolute():
+        sa_path = BASE_DIR / sa_path
+    if not sa_path.exists():
+        raise HTTPException(status_code=500, detail=f"Service account file not found: {sa_path}")
+    creds = service_account.Credentials.from_service_account_file(str(sa_path), scopes=SCOPES)
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -60,11 +57,21 @@ def _calendar_id() -> str:
     return cal_id
 
 
-def _trello_board_id() -> str:
-    board_id = os.environ.get("TRELLO_BOARD_ID", "").strip()
-    if not BOARD_ID_RE.match(board_id):
-        raise HTTPException(status_code=500, detail="TRELLO_BOARD_ID is missing or invalid")
-    return board_id
+def _configured_calendars() -> list[tuple[str, str]]:
+    raw = os.environ.get("CALENDAR_IDS", "").strip()
+    if not raw:
+        return [("Primary", _calendar_id())]
+    calendars: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            label, cid = entry.split(":", 1)
+            calendars.append((label.strip(), cid.strip()))
+        else:
+            calendars.append((entry, entry))
+    return calendars
 
 
 def _gcal_time(value: str) -> dict[str, str]:
@@ -73,7 +80,7 @@ def _gcal_time(value: str) -> dict[str, str]:
 
 class EventCreate(BaseModel):
     summary: str
-    start: str  # ISO-8601 datetime with offset (e.g. 2026-11-24T14:00:00-03:00) or YYYY-MM-DD
+    start: str
     end: str
     description: str = ""
     location: str = ""
@@ -87,93 +94,61 @@ class EventUpdate(BaseModel):
     location: str | None = None
 
 
-@app.get("/trello")
-def get_trello_board(include_archived: bool = False, member: str | None = None) -> dict[str, Any]:
-    state = "all" if include_archived else "open"
-    board_id = _trello_board_id()
-    headers = {
-        "Authorization": f'OAuth oauth_consumer_key="{os.environ["TRELLO_API_KEY"]}", oauth_token="{os.environ["TRELLO_TOKEN"]}"'
-    }
-    params = {
-        "fields": "name,url",
-        "lists": state,
-        "list_fields": "name,pos,closed",
-        "members": "all",
-        "member_fields": "username,fullName",
-        "cards": state,
-        "card_fields": "name,desc,due,dueComplete,idList,idMembers,labels,shortUrl",
-    }
-    try:
-        with httpx.Client(timeout=15.0) as client:
-            resp = client.get(f"https://api.trello.com/1/boards/{board_id}", headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail="Trello API request failed") from None
-    except httpx.RequestError:
-        raise HTTPException(status_code=502, detail="Could not reach Trello API") from None
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
 
-    members_by_id = {
-        m["id"]: {"username": m.get("username", ""), "fullName": m.get("fullName", "")}
-        for m in data.get("members", [])
-    }
-    member_filter = member.strip().lower() if member else None
 
-    lists = {lst["id"]: {"name": lst["name"], "pos": lst["pos"], "cards": []} for lst in data.get("lists", [])}
-    for card in data.get("cards", []):
-        card_members = [members_by_id[mid] for mid in card.get("idMembers", []) if mid in members_by_id]
-        if member_filter and not any(
-            member_filter in (m["username"].lower(), m["fullName"].lower()) for m in card_members
-        ):
-            continue
-        if (target := lists.get(card["idList"])) is not None:
-            target["cards"].append({
-                "name": card["name"],
-                "desc": card["desc"],
-                "due": card["due"],
-                "dueComplete": card["dueComplete"],
-                "members": card_members,
-                "labels": [lbl.get("name") or lbl.get("color") for lbl in card.get("labels", [])],
-                "url": card["shortUrl"],
-            })
-
-    return {"board": data.get("name"), "url": data.get("url"), "lists": sorted(lists.values(), key=lambda x: x["pos"])}
-
-@app.get("/calendar/events")
-def list_events(days_ahead: int = 7, days_behind: int = 0, max_results: int = 30) -> list[dict[str, Any]]:
+@app.get("/calendar/events", dependencies=[Depends(verify_token)])
+def list_events(
+    days_ahead: int = 7,
+    days_behind: int = 0,
+    max_results: int = 30,
+) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
-    try:
-        res = (
-            get_calendar_service()
-            .events()
-            .list(
-                calendarId=_calendar_id(),
-                timeMin=(now - timedelta(days=max(0, days_behind))).isoformat(),
-                timeMax=(now + timedelta(days=max(1, min(days_ahead, 90)))).isoformat(),
-                maxResults=min(max_results, 100),
-                singleEvents=True,
-                orderBy="startTime",
+    time_min = (now - timedelta(days=max(0, days_behind))).isoformat()
+    time_max = (now + timedelta(days=max(1, min(days_ahead, 90)))).isoformat()
+    service = get_calendar_service()
+
+    merged: list[dict[str, Any]] = []
+    for label, cal_id in _configured_calendars():
+        try:
+            res = (
+                service.events()
+                .list(
+                    calendarId=cal_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    maxResults=min(max_results, 100),
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
             )
-            .execute()
-        )
-    except HttpError as exc:
-        raise HTTPException(status_code=exc.resp.status, detail=exc._get_reason()) from None
+        except HttpError as exc:
+            if cal_id == _calendar_id():
+                raise HTTPException(status_code=exc.resp.status, detail=exc._get_reason()) from None
+            continue
 
-    return [
-        {
-            "id": e.get("id"),
-            "summary": e.get("summary", "(No title)"),
-            "start": e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"),
-            "end": e.get("end", {}).get("dateTime") or e.get("end", {}).get("date"),
-            "location": e.get("location", ""),
-            "description": e.get("description", ""),
-        }
-        for e in res.get("items", [])
-    ]
+        for e in res.get("items", []):
+            merged.append(
+                {
+                    "id": e.get("id"),
+                    "calendar": label,
+                    "summary": e.get("summary", "(No title)"),
+                    "start": e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"),
+                    "end": e.get("end", {}).get("dateTime") or e.get("end", {}).get("date"),
+                    "location": e.get("location", ""),
+                    "description": e.get("description", ""),
+                }
+            )
+
+    merged.sort(key=lambda item: item["start"] or "")
+    return merged
 
 
-@app.post("/calendar/events")
-def create_event(payload: EventCreate) -> dict[str, Any]:
+@app.post("/calendar/events", dependencies=[Depends(verify_token)])
+def create_event(payload: EventCreate, calendar_id: str | None = None) -> dict[str, Any]:
     body = {
         "summary": payload.summary,
         "description": payload.description,
@@ -182,30 +157,103 @@ def create_event(payload: EventCreate) -> dict[str, Any]:
         "end": _gcal_time(payload.end),
     }
     try:
-        created = get_calendar_service().events().insert(calendarId=_calendar_id(), body=body).execute()
+        created = (
+            get_calendar_service()
+            .events()
+            .insert(calendarId=calendar_id or _calendar_id(), body=body)
+            .execute()
+        )
     except HttpError as exc:
         raise HTTPException(status_code=exc.resp.status, detail=exc._get_reason()) from None
     return {"id": created.get("id"), "summary": created.get("summary"), "htmlLink": created.get("htmlLink")}
 
 
-@app.patch("/calendar/events/{event_id}")
-def update_event(payload: EventUpdate, event_id: str = ApiPath(pattern=EVENT_ID_PATTERN)) -> dict[str, Any]:
+@app.patch("/calendar/events/{event_id}", dependencies=[Depends(verify_token)])
+def update_event(
+    payload: EventUpdate,
+    event_id: str = ApiPath(pattern=EVENT_ID_PATTERN),
+    calendar_id: str | None = None,
+) -> dict[str, Any]:
     body: dict[str, Any] = payload.model_dump(exclude_none=True, exclude={"start", "end"})
     if payload.start is not None:
         body["start"] = _gcal_time(payload.start)
     if payload.end is not None:
         body["end"] = _gcal_time(payload.end)
     try:
-        updated = get_calendar_service().events().patch(calendarId=_calendar_id(), eventId=event_id, body=body).execute()
+        updated = (
+            get_calendar_service()
+            .events()
+            .patch(calendarId=calendar_id or _calendar_id(), eventId=event_id, body=body)
+            .execute()
+        )
     except HttpError as exc:
         raise HTTPException(status_code=exc.resp.status, detail=exc._get_reason()) from None
     return {"id": updated.get("id"), "summary": updated.get("summary"), "htmlLink": updated.get("htmlLink")}
 
 
-@app.delete("/calendar/events/{event_id}")
-def delete_event(event_id: str = ApiPath(pattern=EVENT_ID_PATTERN)) -> dict[str, str]:
+@app.delete("/calendar/events/{event_id}", dependencies=[Depends(verify_token)])
+def delete_event(
+    event_id: str = ApiPath(pattern=EVENT_ID_PATTERN),
+    calendar_id: str | None = None,
+) -> dict[str, str]:
     try:
-        get_calendar_service().events().delete(calendarId=_calendar_id(), eventId=event_id).execute()
+        get_calendar_service().events().delete(
+            calendarId=calendar_id or _calendar_id(),
+            eventId=event_id,
+        ).execute()
     except HttpError as exc:
         raise HTTPException(status_code=exc.resp.status, detail=exc._get_reason()) from None
     return {"status": "deleted", "id": event_id}
+
+
+@app.get("/trello/cards", dependencies=[Depends(verify_token)])
+def list_trello_cards(member: str | None = None) -> list[dict[str, Any]]:
+    api_key = os.environ.get("TRELLO_API_KEY", "").strip()
+    token = os.environ.get("TRELLO_TOKEN", "").strip()
+    board_id = os.environ.get("TRELLO_BOARD_ID", "").strip()
+    if not (api_key and token and board_id):
+        raise HTTPException(status_code=500, detail="Trello credentials or TRELLO_BOARD_ID missing")
+
+    auth = {"key": api_key, "token": token}
+    base = f"https://api.trello.com/1/boards/{board_id}"
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            cards_resp = client.get(
+                f"{base}/cards/open",
+                params={**auth, "fields": "name,desc,due,dueComplete,idList,idMembers,url,labels"},
+            )
+            cards_resp.raise_for_status()
+            lists_resp = client.get(f"{base}/lists/open", params={**auth, "fields": "name"})
+            lists_resp.raise_for_status()
+            members_resp = client.get(f"{base}/members", params={**auth, "fields": "username,fullName"})
+            members_resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail="Trello API error") from None
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Trello request failed: {exc}") from None
+
+    list_map = {item["id"]: item["name"] for item in lists_resp.json()}
+    member_map = {item["id"]: item.get("username", "") for item in members_resp.json()}
+
+    target_member = member.strip().lstrip("@").lower() if member else None
+    results: list[dict[str, Any]] = []
+
+    for card in cards_resp.json():
+        usernames = [member_map[mid] for mid in card.get("idMembers", []) if mid in member_map]
+        if target_member and not any(u.lower() == target_member for u in usernames):
+            continue
+        results.append(
+            {
+                "id": card.get("id"),
+                "name": card.get("name"),
+                "list": list_map.get(card.get("idList", ""), "Unknown"),
+                "due": card.get("due"),
+                "dueComplete": card.get("dueComplete", False),
+                "members": usernames,
+                "labels": [lbl.get("name") or lbl.get("color") for lbl in card.get("labels", [])],
+                "url": card.get("url"),
+            }
+        )
+
+    return results

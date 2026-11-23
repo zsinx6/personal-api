@@ -9,7 +9,9 @@ requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.165.0",
     "google-api-python-client>=2.202.0",
+    "google-auth>=2.63.1",
     "httpx>=0.28.1",
+    "python-dotenv>=1.2.4",
     "uvicorn>=0.54.0",
 ]
 
