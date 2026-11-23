@@ -47,6 +47,7 @@ def main() -> None:
 
     tr = sub.add_parser("trello", help="Read configured Trello board")
     tr.add_argument("--archived", action="store_true")
+    tr.add_argument("--member", help="Filter cards by member username or full name")
 
     cal = sub.add_parser("cal", help="Manage configured Google Calendar")
     cal_sub = cal.add_subparsers(dest="action", required=True)
@@ -76,7 +77,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.service == "trello":
-        out = request("GET", "/trello", query={"include_archived": str(args.archived).lower()})
+        query = {"include_archived": str(args.archived).lower()}
+        if args.member:
+            query["member"] = args.member
+        out = request("GET", "/trello", query=query)
     elif args.action == "list":
         out = request("GET", "/calendar/events", query={"days_ahead": args.days, "days_behind": args.behind})
     elif args.action == "create":

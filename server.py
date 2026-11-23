@@ -88,7 +88,7 @@ class EventUpdate(BaseModel):
 
 
 @app.get("/trello")
-def get_trello_board(include_archived: bool = False) -> dict[str, Any]:
+def get_trello_board(include_archived: bool = False, member: str | None = None) -> dict[str, Any]:
     state = "all" if include_archived else "open"
     board_id = _trello_board_id()
     headers = {
@@ -98,8 +98,10 @@ def get_trello_board(include_archived: bool = False) -> dict[str, Any]:
         "fields": "name,url",
         "lists": state,
         "list_fields": "name,pos,closed",
+        "members": "all",
+        "member_fields": "username,fullName",
         "cards": state,
-        "card_fields": "name,desc,due,dueComplete,idList,labels,shortUrl",
+        "card_fields": "name,desc,due,dueComplete,idList,idMembers,labels,shortUrl",
     }
     try:
         with httpx.Client(timeout=15.0) as client:
@@ -111,20 +113,31 @@ def get_trello_board(include_archived: bool = False) -> dict[str, Any]:
     except httpx.RequestError:
         raise HTTPException(status_code=502, detail="Could not reach Trello API") from None
 
+    members_by_id = {
+        m["id"]: {"username": m.get("username", ""), "fullName": m.get("fullName", "")}
+        for m in data.get("members", [])
+    }
+    member_filter = member.strip().lower() if member else None
+
     lists = {lst["id"]: {"name": lst["name"], "pos": lst["pos"], "cards": []} for lst in data.get("lists", [])}
     for card in data.get("cards", []):
+        card_members = [members_by_id[mid] for mid in card.get("idMembers", []) if mid in members_by_id]
+        if member_filter and not any(
+            member_filter in (m["username"].lower(), m["fullName"].lower()) for m in card_members
+        ):
+            continue
         if (target := lists.get(card["idList"])) is not None:
             target["cards"].append({
                 "name": card["name"],
                 "desc": card["desc"],
                 "due": card["due"],
                 "dueComplete": card["dueComplete"],
+                "members": card_members,
                 "labels": [lbl.get("name") or lbl.get("color") for lbl in card.get("labels", [])],
                 "url": card["shortUrl"],
             })
 
     return {"board": data.get("name"), "url": data.get("url"), "lists": sorted(lists.values(), key=lambda x: x["pos"])}
-
 
 @app.get("/calendar/events")
 def list_events(days_ahead: int = 7, days_behind: int = 0, max_results: int = 30) -> list[dict[str, Any]]:
