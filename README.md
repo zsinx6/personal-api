@@ -2,8 +2,6 @@
 
 Lightweight FastAPI bridge and CLI wrapper that connects a local **Hermes Agent** instance to **Google Calendar** (multi-calendar read + default-calendar write) and **Trello** (read-only) without external SaaS connectors or OAuth browser flows.
 
----
-
 ## Architecture
 
 - **`server.py`**: FastAPI service running on `glass` (`0.0.0.0:8765` via `systemd` user service) over your Tailscale/LAN network.
@@ -13,26 +11,22 @@ Lightweight FastAPI bridge and CLI wrapper that connects a local **Hermes Agent*
   - Fetches open cards, lists, and member mappings from a configured Trello board on `GET /trello/cards`.
 - **`cli.py`**: Zero-dependency standard-library Python CLI mounted into the Hermes container (`/opt/data/personal-api/cli.py`) for sub-second terminal execution.
 
----
-
 ## Prerequisites & Setup
 
 ### 1. Install Dependencies (`uv`)
 
-```bash
-cd ~/gits/personal-api
-uv sync
-# Or add core packages explicitly:
-uv add fastapi uvicorn httpx python-dotenv google-api-python-client google-auth pydantic
-```
+    cd ~/gits/personal-api
+    uv sync
+    # Or add core packages explicitly:
+    uv add fastapi uvicorn httpx python-dotenv google-api-python-client google-auth pydantic
 
 ### 2. Google Service Account Setup
 
 1. Place your Google Cloud Service Account JSON key at `~/gits/personal-api/service-account.json` (permissions `600`).
 2. Find the service account email:
-   ```bash
-   jq -r '.client_email' ~/gits/personal-api/service-account.json
-   ```
+
+    jq -r '.client_email' ~/gits/personal-api/service-account.json
+
 3. In Google Calendar web settings (**Settings and sharing**):
    - Share your **primary/personal calendar** with the `client_email` using **Make changes to events**.
    - Share any **secondary/work calendars** with the `client_email` using **See all event details** (or **See only free/busy** if restricted by Workspace policy).
@@ -42,19 +36,17 @@ uv add fastapi uvicorn httpx python-dotenv google-api-python-client google-auth 
 
 Create `~/gits/personal-api/.env` (`chmod 600`):
 
-```env
-API_TOKEN=your-strong-random-bearer-token
+    API_TOKEN=your-strong-random-bearer-token
 
-# Google Calendar
-GOOGLE_APPLICATION_CREDENTIALS=/home/zsinx6/gits/personal-api/service-account.json
-CALENDAR_ID=your.personal@gmail.com
-CALENDAR_IDS=Personal:your.personal@gmail.com,Work:your.work@company.com,Holidays:pt.brazilian#holiday@group.v.calendar.google.com
+    # Google Calendar
+    GOOGLE_APPLICATION_CREDENTIALS=/home/zsinx6/gits/personal-api/service-account.json
+    CALENDAR_ID=your.personal@gmail.com
+    CALENDAR_IDS=Personal:your.personal@gmail.com,Work:your.work@company.com,Holidays:pt.brazilian#holiday@group.v.calendar.google.com
 
-# Trello (Read-Only)
-TRELLO_API_KEY=your-trello-api-key
-TRELLO_TOKEN=your-trello-token
-TRELLO_BOARD_ID=your-trello-board-id
-```
+    # Trello (Read-Only)
+    TRELLO_API_KEY=your-trello-api-key
+    TRELLO_TOKEN=your-trello-token
+    TRELLO_BOARD_ID=your-trello-board-id
 
 > **Note:** `CALENDAR_IDS` accepts comma-separated `Label:calendar_id` entries. `CALENDAR_ID` sets the default target calendar for creating, updating, and deleting events.
 
@@ -62,31 +54,25 @@ TRELLO_BOARD_ID=your-trello-board-id
 
 Unit file (`~/.config/systemd/user/personal-api.service`):
 
-```ini
-[Unit]
-Description=Personal Calendar & Trello FastAPI Service
-After=network.target
+    [Unit]
+    Description=Personal Calendar & Trello FastAPI Service
+    After=network.target
 
-[Service]
-Type=simple
-WorkingDirectory=/home/zsinx6/gits/personal-api
-ExecStart=/home/zsinx6/.local/bin/uv run uvicorn server:app --host 0.0.0.0 --port 8765
-Restart=always
-RestartSec=3
+    [Service]
+    Type=simple
+    WorkingDirectory=/home/zsinx6/gits/personal-api
+    ExecStart=/home/zsinx6/.local/bin/uv run uvicorn server:app --host 0.0.0.0 --port 8765
+    Restart=always
+    RestartSec=3
 
-[Install]
-WantedBy=default.target
-```
+    [Install]
+    WantedBy=default.target
 
 Enable and verify:
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now personal-api.service
-curl -s http://localhost:8765/health
-```
-
----
+    systemctl --user daemon-reload
+    systemctl --user enable --now personal-api.service
+    curl -s http://localhost:8765/health
 
 ## CLI Usage (`cli.py`)
 
@@ -94,59 +80,52 @@ curl -s http://localhost:8765/health
 
 ### Google Calendar
 
-```bash
-# List events across all configured calendars for the next 7 days
-python3 /opt/data/personal-api/cli.py cal list --days 7
+    # List events across all configured calendars for the next 7 days
+    python3 /opt/data/personal-api/cli.py cal list --days 7
 
-# List past 7 days + next 14 days (used in productivity audits)
-python3 /opt/data/personal-api/cli.py cal list --behind 7 --days 14
+    # List past 7 days + next 14 days (used in productivity audits)
+    python3 /opt/data/personal-api/cli.py cal list --behind 7 --days 14
 
-# Create a timed event (-03:00 São Paulo timezone)
-python3 /opt/data/personal-api/cli.py cal create \
-  --summary "Update APyB instance" \
-  --start "2026-11-24T14:30:00-03:00" \
-  --end "2026-11-24T15:00:00-03:00"
+    # Create a timed event (-03:00 São Paulo timezone)
+    python3 /opt/data/personal-api/cli.py cal create \
+      --summary "Update APyB instance" \
+      --start "2026-11-24T14:30:00-03:00" \
+      --end "2026-11-24T15:00:00-03:00"
 
-# Create an all-day event
-python3 /opt/data/personal-api/cli.py cal create \
-  --summary "Renew domain" \
-  --start "2026-11-25" \
-  --end "2026-11-26"
+    # Create an all-day event
+    python3 /opt/data/personal-api/cli.py cal create \
+      --summary "Renew domain" \
+      --start "2026-11-25" \
+      --end "2026-11-26"
 
-# Update an existing event (get ID from `cal list` first)
-python3 /opt/data/personal-api/cli.py cal update \
-  --id "<EVENT_ID>" \
-  --summary "Updated title"
+    # Update an existing event (get ID from `cal list` first)
+    python3 /opt/data/personal-api/cli.py cal update \
+      --id "EVENT_ID" \
+      --summary "Updated title"
 
-# Delete an event
-python3 /opt/data/personal-api/cli.py cal delete --id "<EVENT_ID>"
-```
+    # Delete an event
+    python3 /opt/data/personal-api/cli.py cal delete --id "EVENT_ID"
 
 ### Trello (Read-Only)
 
-```bash
-# List open cards assigned to a specific member
-python3 /opt/data/personal-api/cli.py trello --member zsinx6
+    # List open cards assigned to a specific member
+    python3 /opt/data/personal-api/cli.py trello --member zsinx6
 
-# List all open cards on the board
-python3 /opt/data/personal-api/cli.py trello
-```
-
----
+    # List all open cards on the board
+    python3 /opt/data/personal-api/cli.py trello
 
 ## API Endpoints
 
-All endpoints except `/health` require `Authorization: Bearer <API_TOKEN>`.
+All endpoints except `/health` require `Authorization: Bearer API_TOKEN`.
 
 | Method | Path | Description |
-| `GET` | `/health` | Health check (`{"status": "ok"}`) |
+| --- | --- | --- |
+| `GET` | `/health` | Health check (`status: ok`) |
 | `GET` | `/calendar/events` | Query `days_ahead`, `days_behind`, `max_results`; returns merged events labeled by `calendar` |
 | `POST` | `/calendar/events` | Create event in `CALENDAR_ID` (optional `?calendar_id=...` override) |
 | `PATCH` | `/calendar/events/{event_id}` | Update summary, start/end, description, or location |
 | `DELETE` | `/calendar/events/{event_id}` | Delete an event by ID |
-| `GET` | `/trello/cards` | Query optional `?member=<username>`; returns open cards with list names and labels |
-
----
+| `GET` | `/trello/cards` | Query optional `?member=username`; returns open cards with list names and labels |
 
 ## Hermes Agent Integration
 
