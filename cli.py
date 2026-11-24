@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Zero-dependency CLI bridge for personal-api (Calendar, Trello, and SilverBullet Notes)."""
+"""Zero-dependency CLI bridge for personal-api (Calendar, Trello, and Markdown Notes)."""
 
 import argparse
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -13,17 +14,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-TZ_SP = timezone(timedelta(hours=-3))
 ENV_PATH = Path(os.environ.get("PERSONAL_API_ENV", "/opt/data/personal-api/.env"))
 NOTES_DIR = Path(os.environ.get("NOTES_DIR", "/opt/data/notes"))
+DEFAULT_SAMPLE_SIZE = int(os.environ.get("NOTES_TEMPLATE_SAMPLE", "5"))
 
 TASK_OPEN_RE = re.compile(r"^(\s*[-*]\s*)\[\s\](\s+.*)$")
 TASK_LINE_RE = re.compile(r"^(\s*[-*]\s*)\[([ xX>])\]\s+(.*)$")
 DONE_STAMP_RE = re.compile(r"(?:\s*(?:✅|@done\()\s*(\d{4}-\d{2}-\d{2})\)?)\s*$")
 LEADING_CHECKBOX_RE = re.compile(r"^(?:[-*]\s*\[[ xX>]\]\s*|[-*]\s+)")
-HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 DATE_PREFIX_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})")
 ISO_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+PURE_DATE_TITLE_RE = re.compile(r"^\d{4}[-/]?\d{2}[-/]?\d{2}(?:[T\s_-]?\d{2}:?\d{2})?$")
+
+
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -105,7 +111,7 @@ def _note_date(path: Path) -> str:
     m_compact = DATE_PREFIX_RE.match(stem)
     if m_compact:
         return f"{m_compact.group(1)}-{m_compact.group(2)}-{m_compact.group(3)}"
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=TZ_SP)
+    mtime = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
     return mtime.strftime("%Y-%m-%d")
 
 
@@ -120,6 +126,16 @@ def _iter_markdown_files(root: Path) -> list[Path]:
     return sorted(files, key=lambda p: (_note_date(p), p.name))
 
 
+def _find_today_notes(root: Path, now: datetime) -> list[Path]:
+    today_compact = now.strftime("%Y%m%d")
+    today_iso = now.strftime("%Y-%m-%d")
+    return [
+        p
+        for p in _iter_markdown_files(root)
+        if p.stem.startswith(today_compact) or p.stem.startswith(today_iso)
+    ]
+
+
 def _normalize_task_text(raw_text: str) -> tuple[str, str | None]:
     """Strip checkbox/completion stamps and return (clean_text, stamped_done_date)."""
     cleaned = LEADING_CHECKBOX_RE.sub("", raw_text.strip()).strip()
@@ -131,9 +147,146 @@ def _normalize_task_text(raw_text: str) -> tuple[str, str | None]:
     return cleaned, done_date
 
 
-def scan_open_tasks(root: Path, today_str: str) -> list[dict[str, object]]:
-    """Return deduplicated open tasks with first_seen date and whether they exist in today's note."""
+def infer_note_template(root: Path, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict[str, object]:
+    """Inspect the N most recent notes to infer the primary section level, headings, and ordering."""
+    all_files = _iter_markdown_files(root)
+    sample_files = all_files[-max(1, sample_size) :] if all_files else []
+
+    if not sample_files:
+        return {
+            "sample_size": 0,
+            "sampled_files": [],
+            "title": "# Daily Notes",
+            "section_level": 2,
+            "sections": [],
+            "template_markdown": "# Daily Notes\n",
+        }
+
+    level_task_counts: Counter[int] = Counter()
+    all_heading_levels: Counter[int] = Counter()
+    parsed_files: list[list[tuple[int, str]]] = []
+
+    for md_file in sample_files:
+        file_headings: list[tuple[int, str]] = []
+        active_by_level: dict[int, str] = {}
+        for line in md_file.read_text(encoding="utf-8").splitlines():
+            h = HEADING_RE.match(line)
+            if h:
+                lvl = len(h.group(1))
+                text = h.group(2).strip()
+                file_headings.append((lvl, text))
+                all_heading_levels[lvl] += 1
+                active_by_level[lvl] = text
+                for deeper in [k for k in active_by_level if k > lvl]:
+                    del active_by_level[deeper]
+                continue
+
+            if TASK_LINE_RE.match(line) and active_by_level:
+                deepest_lvl = max(active_by_level.keys())
+                level_task_counts[deepest_lvl] += 1
+
+        parsed_files.append(file_headings)
+
+    if level_task_counts:
+        section_level = max(level_task_counts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+    elif all_heading_levels:
+        non_h1 = {lvl: cnt for lvl, cnt in all_heading_levels.items() if lvl >= 2}
+        pool = non_h1 if non_h1 else all_heading_levels
+        section_level = max(pool.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+    else:
+        section_level = 2
+
+    # Detect recurring H1 document title (if section_level > 1 and H1 isn't just a timestamp)
+    title_line: str | None = None
+    if section_level > 1:
+        h1_counts: Counter[str] = Counter()
+        h1_display: dict[str, str] = {}
+        for f_headings in parsed_files:
+            seen_in_file: set[str] = set()
+            for lvl, text in f_headings:
+                if lvl == 1 and not PURE_DATE_TITLE_RE.match(text):
+                    key = text.lower()
+                    if key not in seen_in_file:
+                        seen_in_file.add(key)
+                        h1_counts[key] += 1
+                        h1_display[key] = text
+        if h1_counts:
+            top_key, top_cnt = h1_counts.most_common(1)[0]
+            if top_cnt >= max(1, len(sample_files) // 2):
+                title_line = f"# {h1_display[top_key]}"
+
+    # Extract ordered recurring sections at section_level
+    sec_counts: Counter[str] = Counter()
+    sec_display: dict[str, str] = {}
+    sec_positions: dict[str, list[float]] = defaultdict(list)
+    sec_last_seen_idx: dict[str, int] = {}
+
+    for file_idx, f_headings in enumerate(parsed_files):
+        secs_in_file = [text for lvl, text in f_headings if lvl == section_level]
+        total = max(1, len(secs_in_file))
+        seen_in_file: set[str] = set()
+        for pos_idx, text in enumerate(secs_in_file):
+            key = text.lower()
+            if key in seen_in_file:
+                continue
+            seen_in_file.add(key)
+            sec_counts[key] += 1
+            sec_display[key] = text
+            sec_positions[key].append(pos_idx / total)
+            sec_last_seen_idx[key] = file_idx
+
+    min_occurrences = 2 if (len(sample_files) >= 2 and any(c >= 2 for c in sec_counts.values())) else 1
+    chosen_keys = [k for k, c in sec_counts.items() if c >= min_occurrences]
+    chosen_keys.sort(key=lambda k: (sum(sec_positions[k]) / len(sec_positions[k]), -sec_last_seen_idx[k]))
+    ordered_sections = [sec_display[k] for k in chosen_keys]
+
+    heading_prefix = "#" * section_level
+    lines: list[str] = []
+    if title_line:
+        lines.append(title_line)
+    for sec in ordered_sections:
+        if lines:
+            lines.append("")
+        lines.append(f"{heading_prefix} {sec}")
+
+    template_md = ("\n".join(lines) + "\n") if lines else ""
+
+    return {
+        "sample_size": len(sample_files),
+        "sampled_files": [str(p.relative_to(root)) for p in sample_files],
+        "title": title_line,
+        "section_level": section_level,
+        "sections": ordered_sections,
+        "template_markdown": template_md,
+    }
+
+
+def _match_heading_name(heading_text: str, target_text: str) -> int:
+    """Return match quality score (0 = no match, 1 = prefix/colon match, 2 = exact case-insensitive match)."""
+    h_clean = heading_text.strip().lower()
+    t_clean = target_text.strip().lower()
+    if not h_clean or not t_clean:
+        return 0
+    if h_clean == t_clean:
+        return 2
+    if (
+        h_clean.startswith(f"{t_clean} ")
+        or h_clean.startswith(f"{t_clean}(")
+        or h_clean.startswith(f"{t_clean}:")
+    ):
+        return 1
+    return 0
+
+
+def scan_open_tasks(
+    root: Path,
+    today_str: str,
+    sample_size: int = DEFAULT_SAMPLE_SIZE,
+) -> list[dict[str, object]]:
+    """Return deduplicated open tasks with first_seen date, inferred section, and in_today_note flag."""
     today_dt = datetime.strptime(today_str, "%Y-%m-%d").date()
+    tmpl = infer_note_template(root, sample_size)
+    sec_level = int(tmpl["section_level"])
     merged: dict[str, dict[str, object]] = {}
 
     for md_file in _iter_markdown_files(root):
@@ -144,8 +297,14 @@ def scan_open_tasks(root: Path, today_str: str) -> list[dict[str, object]]:
         for idx, line in enumerate(md_file.read_text(encoding="utf-8").splitlines(), start=1):
             h = HEADING_RE.match(line)
             if h:
-                current_section = h.group(2)
+                lvl = len(h.group(1))
+                text = h.group(2).strip()
+                if lvl == sec_level:
+                    current_section = text
+                elif lvl < sec_level and not PURE_DATE_TITLE_RE.match(text) and current_section == "Uncategorized":
+                    current_section = text
                 continue
+
             m = TASK_OPEN_RE.match(line)
             if not m:
                 continue
@@ -189,9 +348,15 @@ def scan_open_tasks(root: Path, today_str: str) -> list[dict[str, object]]:
     return results
 
 
-def build_task_lifecycle(root: Path, today_str: str) -> list[dict[str, object]]:
+def build_task_lifecycle(
+    root: Path,
+    today_str: str,
+    sample_size: int = DEFAULT_SAMPLE_SIZE,
+) -> list[dict[str, object]]:
     """Aggregate every task ([ ], [x], [>]) across all notes to track first_seen and done_date."""
     today_dt = datetime.strptime(today_str, "%Y-%m-%d").date()
+    tmpl = infer_note_template(root, sample_size)
+    sec_level = int(tmpl["section_level"])
     registry: dict[str, dict[str, object]] = {}
 
     for md_file in _iter_markdown_files(root):
@@ -202,7 +367,12 @@ def build_task_lifecycle(root: Path, today_str: str) -> list[dict[str, object]]:
         for line in md_file.read_text(encoding="utf-8").splitlines():
             h = HEADING_RE.match(line)
             if h:
-                current_section = h.group(2)
+                lvl = len(h.group(1))
+                text = h.group(2).strip()
+                if lvl == sec_level:
+                    current_section = text
+                elif lvl < sec_level and not PURE_DATE_TITLE_RE.match(text) and current_section == "Uncategorized":
+                    current_section = text
                 continue
 
             m = TASK_LINE_RE.match(line)
@@ -263,20 +433,15 @@ def build_task_lifecycle(root: Path, today_str: str) -> list[dict[str, object]]:
     return results
 
 
-def _resolve_target_note(root: Path, now: datetime) -> Path:
+def _resolve_target_note(root: Path, now: datetime, sample_size: int = DEFAULT_SAMPLE_SIZE) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    today_compact = now.strftime("%Y%m%d")
-    today_iso = now.strftime("%Y-%m-%d")
-    candidates = _iter_markdown_files(root)
-
-    today_matches = [
-        p for p in candidates if p.stem.startswith(today_compact) or p.stem.startswith(today_iso)
-    ]
+    today_matches = _find_today_notes(root, now)
     if today_matches:
         return sorted(today_matches)[-1]
 
+    tmpl = infer_note_template(root, sample_size)
     new_note = root / f"{now.strftime('%Y%m%d%H%M')}.md"
-    new_note.write_text("# Daily Notes\n\n## Work\n\n## APyB\n\n## Personal\n", encoding="utf-8")
+    new_note.write_text(str(tmpl["template_markdown"]), encoding="utf-8")
     return new_note
 
 
@@ -289,12 +454,12 @@ def _is_section_boundary(line: str, section_level: int) -> bool:
     return False
 
 
-def _matches_section(heading_text: str, target_lower: str) -> bool:
-    clean = heading_text.strip().lower()
-    return clean == target_lower or clean.startswith(f"{target_lower} ") or clean.startswith(f"{target_lower}(")
-
-
-def _insert_task_into_note(target: Path, task_text: str, section: str | None) -> tuple[str, str]:
+def _insert_task_into_note(
+    target: Path,
+    task_text: str,
+    section: str | None,
+    tmpl: dict[str, object],
+) -> tuple[str, str]:
     lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
     rel_target = str(target.relative_to(NOTES_DIR)) if target.is_relative_to(NOTES_DIR) else str(target)
 
@@ -306,26 +471,67 @@ def _insert_task_into_note(target: Path, task_text: str, section: str | None) ->
                 return "skipped_duplicate_in_target_note", rel_target
 
     new_line = f"- [ ] {task_text}"
+    default_sec_level = int(tmpl["section_level"])
+    template_sections = [str(s) for s in list(tmpl["sections"])]
 
-    if section:
-        section_lower = section.strip().lower()
-        insert_idx: int | None = None
+    if section and section != "Uncategorized":
+        # Find best matching heading in target (exact match preferred over prefix match)
+        best_idx: int | None = None
+        best_level: int = default_sec_level
+        best_score = 0
+
         for idx, line in enumerate(lines):
             h = HEADING_RE.match(line)
-            if h and len(h.group(1)) >= 2 and _matches_section(h.group(2), section_lower):
-                sec_level = len(h.group(1))
-                insert_idx = idx + 1
-                while insert_idx < len(lines) and not _is_section_boundary(lines[insert_idx], sec_level):
-                    insert_idx += 1
-                while insert_idx > idx + 1 and lines[insert_idx - 1].strip() == "":
-                    insert_idx -= 1
-                break
-        if insert_idx is not None:
+            if not h:
+                continue
+            score = _match_heading_name(h.group(2), section)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+                best_level = len(h.group(1))
+
+        if best_idx is not None:
+            insert_idx = best_idx + 1
+            while insert_idx < len(lines) and not _is_section_boundary(lines[insert_idx], best_level):
+                insert_idx += 1
+            while insert_idx > best_idx + 1 and lines[insert_idx - 1].strip() == "":
+                insert_idx -= 1
             lines.insert(insert_idx, new_line)
         else:
-            if lines and lines[-1].strip() != "":
-                lines.append("")
-            lines.extend([f"## {section.strip()}", new_line])
+            # Section does not exist in target yet: insert it in the inferred template order
+            canonical_name = next(
+                (s for s in template_sections if _match_heading_name(s, section) > 0),
+                section.strip(),
+            )
+            heading_line = f"{'#' * default_sec_level} {canonical_name}"
+
+            # Determine which template sections come after canonical_name
+            after_sections: list[str] = []
+            for i, s in enumerate(template_sections):
+                if s.lower() == canonical_name.lower():
+                    after_sections = template_sections[i + 1 :]
+                    break
+
+            insert_heading_at: int | None = None
+            if after_sections:
+                for idx, line in enumerate(lines):
+                    h = HEADING_RE.match(line)
+                    if h and len(h.group(1)) == default_sec_level:
+                        if any(_match_heading_name(h.group(2), nxt) > 0 for nxt in after_sections):
+                            insert_heading_at = idx
+                            break
+
+            if insert_heading_at is not None:
+                block = [heading_line, new_line, ""]
+                lines[insert_heading_at:insert_heading_at] = block
+            elif lines and lines[-1].strip() == "---":
+                pos = len(lines) - 1
+                block = (["", heading_line, new_line] if pos > 0 and lines[pos - 1].strip() != "" else [heading_line, new_line])
+                lines[pos:pos] = block
+            else:
+                if lines and lines[-1].strip() != "":
+                    lines.append("")
+                lines.extend([heading_line, new_line])
     else:
         if lines and lines[-1].strip() == "---":
             lines.insert(len(lines) - 1, new_line)
@@ -358,15 +564,20 @@ def _mark_forwarded_in_older_notes(root: Path, task_lower: str, exclude_path: Pa
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
-    now = datetime.now(TZ_SP)
+    now = _local_now()
     today_str = now.strftime("%Y-%m-%d")
+    today_notes = _find_today_notes(NOTES_DIR, now)
+    tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
+
+    cfg = load_env(ENV_PATH)
+    member = args.member or os.environ.get("TRELLO_MEMBER") or cfg.get("TRELLO_MEMBER") or None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_trello = pool.submit(
             api_request,
             "GET",
             "/trello/cards",
-            {"member": args.member} if args.member else None,
+            {"member": member} if member else None,
         )
         fut_cal = pool.submit(
             api_request,
@@ -374,13 +585,16 @@ def cmd_audit(args: argparse.Namespace) -> None:
             "/calendar/events",
             {"days_behind": args.behind, "days_ahead": args.days},
         )
-        open_notes = scan_open_tasks(NOTES_DIR, today_str)
+        open_notes = scan_open_tasks(NOTES_DIR, today_str, args.sample_notes)
         trello_cards = fut_trello.result()
         cal_events = fut_cal.result()
 
     output = {
         "now": now.isoformat(timespec="seconds"),
         "today": today_str,
+        "today_note_exists": bool(today_notes),
+        "today_note": str(sorted(today_notes)[-1].relative_to(NOTES_DIR)) if today_notes else None,
+        "inferred_sections": tmpl["sections"],
         "notes_open": open_notes,
         "trello_cards": trello_cards,
         "calendar_events": cal_events,
@@ -388,19 +602,23 @@ def cmd_audit(args: argparse.Namespace) -> None:
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
+def cmd_notes_template(args: argparse.Namespace) -> None:
+    tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
+    print(json.dumps(tmpl, ensure_ascii=False, indent=2))
+
+
 def cmd_summarize(args: argparse.Namespace) -> None:
-    now = datetime.now(TZ_SP)
+    now = _local_now()
     today_str = now.strftime("%Y-%m-%d")
     today_dt = now.date()
 
-    items = build_task_lifecycle(NOTES_DIR, today_str)
+    items = build_task_lifecycle(NOTES_DIR, today_str, args.sample_notes)
 
     if args.status != "all":
         items = [i for i in items if i["status"] == args.status]
 
     if args.section:
-        sec_lower = args.section.strip().lower()
-        items = [i for i in items if _matches_section(str(i["section"]), sec_lower)]
+        items = [i for i in items if _match_heading_name(str(i["section"]), args.section) > 0]
 
     if args.days is not None:
         cutoff = (today_dt - timedelta(days=args.days)).strftime("%Y-%m-%d")
@@ -452,16 +670,17 @@ def cmd_summarize(args: argparse.Namespace) -> None:
 
 
 def cmd_notes_add(args: argparse.Namespace) -> None:
-    now = datetime.now(TZ_SP)
+    now = _local_now()
     task_text, _ = _normalize_task_text(args.text)
     if not task_text:
         raise RuntimeError("Task text cannot be empty")
 
-    target = Path(args.file) if args.file else _resolve_target_note(NOTES_DIR, now)
+    tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
+    target = Path(args.file) if args.file else _resolve_target_note(NOTES_DIR, now, args.sample_notes)
     if not target.is_absolute():
         target = NOTES_DIR / target
 
-    status, rel_target = _insert_task_into_note(target, task_text, args.section)
+    status, rel_target = _insert_task_into_note(target, task_text, args.section, tmpl)
     print(
         json.dumps(
             {
@@ -477,13 +696,15 @@ def cmd_notes_add(args: argparse.Namespace) -> None:
 
 def cmd_notes_rollover(args: argparse.Namespace) -> None:
     """Copy an open task from an earlier note into today's note and mark the old line - [>]."""
-    now = datetime.now(TZ_SP)
+    now = _local_now()
     today_str = now.strftime("%Y-%m-%d")
     needle, _ = _normalize_task_text(args.match)
     needle_lower = needle.lower()
-    target = _resolve_target_note(NOTES_DIR, now)
 
-    open_tasks = scan_open_tasks(NOTES_DIR, today_str)
+    tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
+    target = _resolve_target_note(NOTES_DIR, now, args.sample_notes)
+
+    open_tasks = scan_open_tasks(NOTES_DIR, today_str, args.sample_notes)
     matches = [
         t
         for t in open_tasks
@@ -499,7 +720,7 @@ def cmd_notes_rollover(args: argparse.Namespace) -> None:
     item = matches[0]
     task_text = str(item["text"])
     section = args.section or (str(item["section"]) if item["section"] != "Uncategorized" else None)
-    status, rel_target = _insert_task_into_note(target, task_text, section)
+    status, rel_target = _insert_task_into_note(target, task_text, section, tmpl)
     forwarded_from = _mark_forwarded_in_older_notes(NOTES_DIR, task_text.lower(), target)
 
     print(
@@ -517,8 +738,74 @@ def cmd_notes_rollover(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_notes_rollover_all(args: argparse.Namespace) -> None:
+    """Roll over every open task missing from today's note into its original section."""
+    now = _local_now()
+    today_str = now.strftime("%Y-%m-%d")
+    today_notes = _find_today_notes(NOTES_DIR, now)
+
+    if args.only_if_today_exists and not today_notes:
+        print(
+            json.dumps(
+                {
+                    "status": "skipped_no_today_note",
+                    "today": today_str,
+                    "rolled_over": [],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
+    open_tasks = scan_open_tasks(NOTES_DIR, today_str, args.sample_notes)
+    missing = [t for t in open_tasks if not bool(t["in_today_note"])]
+    if not missing:
+        print(
+            json.dumps(
+                {
+                    "status": "nothing_to_rollover",
+                    "today_note": str(sorted(today_notes)[-1].relative_to(NOTES_DIR)) if today_notes else None,
+                    "rolled_over": [],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    target = _resolve_target_note(NOTES_DIR, now, args.sample_notes)
+    rolled: list[dict[str, object]] = []
+    for item in missing:
+        task_text = str(item["text"])
+        section = str(item["section"]) if item["section"] != "Uncategorized" else None
+        status, rel_target = _insert_task_into_note(target, task_text, section, tmpl)
+        forwarded_from = _mark_forwarded_in_older_notes(NOTES_DIR, task_text.lower(), target)
+        rolled.append(
+            {
+                "status": "rolled_over" if status == "added" else status,
+                "task": task_text,
+                "section": section or "End of file",
+                "first_seen": item["first_seen"],
+                "forwarded_from": forwarded_from,
+            }
+        )
+
+    print(
+        json.dumps(
+            {
+                "status": "completed",
+                "to_file": str(target.relative_to(NOTES_DIR)),
+                "count": len(rolled),
+                "rolled_over": rolled,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def cmd_notes_done(args: argparse.Namespace) -> None:
-    now = datetime.now(TZ_SP)
+    now = _local_now()
     today_str = now.strftime("%Y-%m-%d")
     needle, _ = _normalize_task_text(args.match)
     needle_lower = needle.lower()
@@ -571,7 +858,9 @@ def cmd_notes_done(args: argparse.Namespace) -> None:
 
 
 def cmd_trello(args: argparse.Namespace) -> None:
-    res = api_request("GET", "/trello/cards", {"member": args.member} if args.member else None)
+    cfg = load_env(ENV_PATH)
+    member = args.member or os.environ.get("TRELLO_MEMBER") or cfg.get("TRELLO_MEMBER") or None
+    res = api_request("GET", "/trello/cards", {"member": member} if member else None)
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
@@ -633,33 +922,53 @@ def build_parser() -> argparse.ArgumentParser:
 
     # audit
     p_audit = sub.add_parser("audit", help="Single-call state dump of notes, Trello, and Calendar")
-    p_audit.add_argument("--member", default="zsinx6", help="Trello username filter (default: zsinx6)")
+    p_audit.add_argument("--member", default=None, help="Trello username filter (or set TRELLO_MEMBER)")
     p_audit.add_argument("--behind", type=int, default=7, help="Calendar days behind (default: 7)")
     p_audit.add_argument("--days", type=int, default=14, help="Calendar days ahead (default: 14)")
+    p_audit.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer sections")
     p_audit.set_defaults(func=cmd_audit)
 
     # summarize
     p_sum = sub.add_parser("summarize", help="Lifecycle summary of open & done tasks with first_seen and done_date")
     p_sum.add_argument("--status", choices=["all", "open", "done"], default="all", help="Filter by status")
-    p_sum.add_argument("--section", default=None, help="Filter by domain (Work, APyB, Personal)")
+    p_sum.add_argument("--section", default=None, help="Filter by section heading")
     p_sum.add_argument("--days", type=int, default=None, help="Only tasks active/done in the last N days")
+    p_sum.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer sections")
     p_sum.add_argument("--md", action="store_true", help="Output formatted Markdown instead of JSON")
     p_sum.set_defaults(func=cmd_summarize)
 
     # notes
-    p_notes = sub.add_parser("notes", help="Manage SilverBullet Markdown tasks")
+    p_notes = sub.add_parser("notes", help="Manage Markdown tasks")
     notes_sub = p_notes.add_subparsers(dest="notes_cmd", required=True)
+
+    p_n_tmpl = notes_sub.add_parser("template", help="Inspect the note template inferred from the N most recent notes")
+    p_n_tmpl.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Number of recent notes to inspect")
+    p_n_tmpl.set_defaults(func=cmd_notes_template)
 
     p_n_add = notes_sub.add_parser("add", help="Add an open task (- [ ]) to today's note")
     p_n_add.add_argument("text", help="Task description")
-    p_n_add.add_argument("--section", help="Target Markdown heading (e.g. Work, APyB, Personal)")
-    p_n_add.add_argument("--file", help="Specific target note relative to /opt/data/notes")
+    p_n_add.add_argument("--section", help="Target section heading")
+    p_n_add.add_argument("--file", help="Specific target note relative to NOTES_DIR")
+    p_n_add.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer template")
     p_n_add.set_defaults(func=cmd_notes_add)
 
-    p_n_roll = notes_sub.add_parser("rollover", help="Bring an open task from an earlier note into today's note")
+    p_n_roll = notes_sub.add_parser("rollover", help="Bring a single open task from an earlier note into today's note")
     p_n_roll.add_argument("match", help="Unique substring matching the task text")
-    p_n_roll.add_argument("--section", help="Target Markdown heading (defaults to original section)")
+    p_n_roll.add_argument("--section", help="Target section heading (defaults to original section)")
+    p_n_roll.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer template")
     p_n_roll.set_defaults(func=cmd_notes_rollover)
+
+    p_n_roll_all = notes_sub.add_parser(
+        "rollover-all",
+        help="Roll over all open tasks missing from today's note into their original sections",
+    )
+    p_n_roll_all.add_argument(
+        "--only-if-today-exists",
+        action="store_true",
+        help="Skip unless today's YYYYMMDD*.md / YYYY-MM-DD*.md note already exists",
+    )
+    p_n_roll_all.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer template")
+    p_n_roll_all.set_defaults(func=cmd_notes_rollover_all)
 
     p_n_done = notes_sub.add_parser("done", help="Mark an open task (- [ ]) done and stamp ✅ YYYY-MM-DD")
     p_n_done.add_argument("match", help="Unique substring matching the task text")
