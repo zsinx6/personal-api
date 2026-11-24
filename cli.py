@@ -18,8 +18,8 @@ ENV_PATH = Path(os.environ.get("PERSONAL_API_ENV", "/opt/data/personal-api/.env"
 NOTES_DIR = Path(os.environ.get("NOTES_DIR", "/opt/data/notes"))
 DEFAULT_SAMPLE_SIZE = int(os.environ.get("NOTES_TEMPLATE_SAMPLE", "5"))
 
-TASK_OPEN_RE = re.compile(r"^(\s*[-*]\s*)\[\s\](\s+.*)$")
-TASK_LINE_RE = re.compile(r"^(\s*[-*]\s*)\[([ xX>])\]\s+(.*)$")
+TASK_OPEN_RE = re.compile(r"^(\s*[-*]\s*)\[\s\](?:\s+(.*))?$")
+TASK_LINE_RE = re.compile(r"^(\s*[-*]\s*)\[([ xX>])\](?:\s+(.*))?$")
 DONE_STAMP_RE = re.compile(r"(?:\s*(?:✅|@done\()\s*(\d{4}-\d{2}-\d{2})\)?)\s*$")
 LEADING_CHECKBOX_RE = re.compile(r"^(?:[-*]\s*\[[ xX>]\]\s*|[-*]\s+)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -136,8 +136,19 @@ def _find_today_notes(root: Path, now: datetime) -> list[Path]:
     ]
 
 
-def _normalize_task_text(raw_text: str) -> tuple[str, str | None]:
+def _body_start_index(lines: list[str]) -> int:
+    """Return the first line index after YAML frontmatter (if any)."""
+    if lines and lines[0].strip() == "---":
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() in ("---", "..."):
+                return idx + 1
+    return 0
+
+
+def _normalize_task_text(raw_text: str | None) -> tuple[str, str | None]:
     """Strip checkbox/completion stamps and return (clean_text, stamped_done_date)."""
+    if not raw_text:
+        return "", None
     cleaned = LEADING_CHECKBOX_RE.sub("", raw_text.strip()).strip()
     done_date: str | None = None
     m_stamp = DONE_STAMP_RE.search(cleaned)
@@ -145,120 +156,6 @@ def _normalize_task_text(raw_text: str) -> tuple[str, str | None]:
         done_date = m_stamp.group(1)
         cleaned = DONE_STAMP_RE.sub("", cleaned).strip()
     return cleaned, done_date
-
-
-def infer_note_template(root: Path, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict[str, object]:
-    """Inspect the N most recent notes to infer the primary section level, headings, and ordering."""
-    all_files = _iter_markdown_files(root)
-    sample_files = all_files[-max(1, sample_size) :] if all_files else []
-
-    if not sample_files:
-        return {
-            "sample_size": 0,
-            "sampled_files": [],
-            "title": "# Daily Notes",
-            "section_level": 2,
-            "sections": [],
-            "template_markdown": "# Daily Notes\n",
-        }
-
-    level_task_counts: Counter[int] = Counter()
-    all_heading_levels: Counter[int] = Counter()
-    parsed_files: list[list[tuple[int, str]]] = []
-
-    for md_file in sample_files:
-        file_headings: list[tuple[int, str]] = []
-        active_by_level: dict[int, str] = {}
-        for line in md_file.read_text(encoding="utf-8").splitlines():
-            h = HEADING_RE.match(line)
-            if h:
-                lvl = len(h.group(1))
-                text = h.group(2).strip()
-                file_headings.append((lvl, text))
-                all_heading_levels[lvl] += 1
-                active_by_level[lvl] = text
-                for deeper in [k for k in active_by_level if k > lvl]:
-                    del active_by_level[deeper]
-                continue
-
-            if TASK_LINE_RE.match(line) and active_by_level:
-                deepest_lvl = max(active_by_level.keys())
-                level_task_counts[deepest_lvl] += 1
-
-        parsed_files.append(file_headings)
-
-    if level_task_counts:
-        section_level = max(level_task_counts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
-    elif all_heading_levels:
-        non_h1 = {lvl: cnt for lvl, cnt in all_heading_levels.items() if lvl >= 2}
-        pool = non_h1 if non_h1 else all_heading_levels
-        section_level = max(pool.items(), key=lambda kv: (kv[1], -kv[0]))[0]
-    else:
-        section_level = 2
-
-    # Detect recurring H1 document title (if section_level > 1 and H1 isn't just a timestamp)
-    title_line: str | None = None
-    if section_level > 1:
-        h1_counts: Counter[str] = Counter()
-        h1_display: dict[str, str] = {}
-        for f_headings in parsed_files:
-            seen_in_file: set[str] = set()
-            for lvl, text in f_headings:
-                if lvl == 1 and not PURE_DATE_TITLE_RE.match(text):
-                    key = text.lower()
-                    if key not in seen_in_file:
-                        seen_in_file.add(key)
-                        h1_counts[key] += 1
-                        h1_display[key] = text
-        if h1_counts:
-            top_key, top_cnt = h1_counts.most_common(1)[0]
-            if top_cnt >= max(1, len(sample_files) // 2):
-                title_line = f"# {h1_display[top_key]}"
-
-    # Extract ordered recurring sections at section_level
-    sec_counts: Counter[str] = Counter()
-    sec_display: dict[str, str] = {}
-    sec_positions: dict[str, list[float]] = defaultdict(list)
-    sec_last_seen_idx: dict[str, int] = {}
-
-    for file_idx, f_headings in enumerate(parsed_files):
-        secs_in_file = [text for lvl, text in f_headings if lvl == section_level]
-        total = max(1, len(secs_in_file))
-        seen_in_file: set[str] = set()
-        for pos_idx, text in enumerate(secs_in_file):
-            key = text.lower()
-            if key in seen_in_file:
-                continue
-            seen_in_file.add(key)
-            sec_counts[key] += 1
-            sec_display[key] = text
-            sec_positions[key].append(pos_idx / total)
-            sec_last_seen_idx[key] = file_idx
-
-    min_occurrences = 2 if (len(sample_files) >= 2 and any(c >= 2 for c in sec_counts.values())) else 1
-    chosen_keys = [k for k, c in sec_counts.items() if c >= min_occurrences]
-    chosen_keys.sort(key=lambda k: (sum(sec_positions[k]) / len(sec_positions[k]), -sec_last_seen_idx[k]))
-    ordered_sections = [sec_display[k] for k in chosen_keys]
-
-    heading_prefix = "#" * section_level
-    lines: list[str] = []
-    if title_line:
-        lines.append(title_line)
-    for sec in ordered_sections:
-        if lines:
-            lines.append("")
-        lines.append(f"{heading_prefix} {sec}")
-
-    template_md = ("\n".join(lines) + "\n") if lines else ""
-
-    return {
-        "sample_size": len(sample_files),
-        "sampled_files": [str(p.relative_to(root)) for p in sample_files],
-        "title": title_line,
-        "section_level": section_level,
-        "sections": ordered_sections,
-        "template_markdown": template_md,
-    }
 
 
 def _match_heading_name(heading_text: str, target_text: str) -> int:
@@ -278,59 +175,294 @@ def _match_heading_name(heading_text: str, target_text: str) -> int:
     return 0
 
 
-def scan_open_tasks(
-    root: Path,
-    today_str: str,
-    sample_size: int = DEFAULT_SAMPLE_SIZE,
-) -> list[dict[str, object]]:
-    """Return deduplicated open tasks with first_seen date, inferred section, and in_today_note flag."""
+def infer_note_template(root: Path, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict[str, object]:
+    """Inspect the N most recent notes to infer section hierarchy, task leaf headings, and layout."""
+    all_files = _iter_markdown_files(root)
+    sample_files = all_files[-max(1, sample_size) :] if all_files else []
+
+    if not sample_files:
+        return {
+            "sample_size": 0,
+            "sampled_files": [],
+            "title_mode": "static",
+            "title": "# Daily Notes",
+            "top_section_level": 2,
+            "sections": [],
+            "section_children": {},
+            "task_leaf_by_section": {},
+            "default_task_leaf": None,
+            "use_dividers": False,
+            "template_markdown": "# Daily Notes\n",
+        }
+
+    top_level_counts: Counter[int] = Counter()
+    all_heading_levels: Counter[int] = Counter()
+    divider_files = 0
+    parsed_files: list[dict[str, object]] = []
+
+    for md_file in sample_files:
+        lines = md_file.read_text(encoding="utf-8").splitlines()
+        start = _body_start_index(lines)
+        file_headings: list[tuple[int, str]] = []
+        active_by_level: dict[int, str] = {}
+        task_paths: list[tuple[str, ...]] = []
+        has_divider = False
+
+        for line in lines[start:]:
+            if line.strip() == "---":
+                has_divider = True
+                continue
+            h = HEADING_RE.match(line)
+            if h:
+                lvl = len(h.group(1))
+                text = h.group(2).strip()
+                file_headings.append((lvl, text))
+                all_heading_levels[lvl] += 1
+                if lvl == 1 and PURE_DATE_TITLE_RE.match(text):
+                    continue
+                active_by_level[lvl] = text
+                for deeper in [k for k in active_by_level if k > lvl]:
+                    del active_by_level[deeper]
+                continue
+
+            m_task = TASK_LINE_RE.match(line)
+            if m_task and active_by_level:
+                path = tuple(active_by_level[k] for k in sorted(active_by_level))
+                task_paths.append(path)
+                top_lvl = min(active_by_level.keys())
+                top_level_counts[top_lvl] += 1
+
+        if has_divider:
+            divider_files += 1
+        parsed_files.append({"headings": file_headings, "task_paths": task_paths})
+
+    if top_level_counts:
+        top_section_level = max(top_level_counts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+    elif all_heading_levels:
+        non_date_h1 = [lvl for lvl in all_heading_levels if lvl >= 2]
+        top_section_level = min(non_date_h1) if non_date_h1 else min(all_heading_levels.keys())
+    else:
+        top_section_level = 2
+
+    # Detect H1 title style (date-stamped vs static vs none)
+    date_h1_count = 0
+    static_h1_counts: Counter[str] = Counter()
+    static_h1_display: dict[str, str] = {}
+    if top_section_level > 1:
+        for pdata in parsed_files:
+            f_headings = list(pdata["headings"])  # type: ignore[arg-type]
+            for lvl, text in f_headings:
+                if lvl == 1:
+                    if PURE_DATE_TITLE_RE.match(text):
+                        date_h1_count += 1
+                    else:
+                        static_h1_counts[text.lower()] += 1
+                        static_h1_display[text.lower()] = text
+                    break
+
+    title_mode = "none"
+    title_line: str | None = None
+    if date_h1_count >= max(1, len(sample_files) // 2):
+        title_mode = "date"
+        title_line = "# {date}"
+    elif static_h1_counts:
+        top_k, top_c = static_h1_counts.most_common(1)[0]
+        if top_c >= max(1, len(sample_files) // 2):
+            title_mode = "static"
+            title_line = f"# {static_h1_display[top_k]}"
+
+    # Extract ordered recurring top-level sections and their child subheadings
+    sec_counts: Counter[str] = Counter()
+    sec_display: dict[str, str] = {}
+    sec_positions: dict[str, list[float]] = defaultdict(list)
+    sec_last_seen: dict[str, int] = {}
+
+    child_counts_by_sec: dict[str, Counter[str]] = defaultdict(Counter)
+    child_display_by_sec: dict[str, dict[str, str]] = defaultdict(dict)
+    child_order_by_sec: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+
+    task_leaf_counts_by_sec: dict[str, Counter[str]] = defaultdict(Counter)
+    global_task_leaf_counts: Counter[str] = Counter()
+    global_leaf_display: dict[str, str] = {}
+
+    for file_idx, pdata in enumerate(parsed_files):
+        f_headings: list[tuple[int, str]] = pdata["headings"]  # type: ignore[assignment]
+        t_paths: list[tuple[str, ...]] = pdata["task_paths"]  # type: ignore[assignment]
+
+        top_secs_in_file: list[str] = []
+        current_top_key: str | None = None
+        child_idx = 0
+
+        for lvl, text in f_headings:
+            if lvl == 1 and PURE_DATE_TITLE_RE.match(text):
+                continue
+            if lvl == top_section_level:
+                key = text.lower()
+                current_top_key = key
+                child_idx = 0
+                if key not in top_secs_in_file:
+                    top_secs_in_file.append(text)
+            elif lvl > top_section_level and current_top_key is not None:
+                ckey = text.lower()
+                child_counts_by_sec[current_top_key][ckey] += 1
+                child_display_by_sec[current_top_key][ckey] = text
+                child_order_by_sec[current_top_key][ckey].append(child_idx)
+                child_idx += 1
+
+        total = max(1, len(top_secs_in_file))
+        for pos_idx, text in enumerate(top_secs_in_file):
+            key = text.lower()
+            sec_counts[key] += 1
+            sec_display[key] = text
+            sec_positions[key].append(pos_idx / total)
+            sec_last_seen[key] = file_idx
+
+        for path in t_paths:
+            if len(path) >= 2:
+                top_k = path[0].lower()
+                leaf_text = path[-1]
+                leaf_k = leaf_text.lower()
+                task_leaf_counts_by_sec[top_k][leaf_k] += 1
+                global_task_leaf_counts[leaf_k] += 1
+                global_leaf_display[leaf_k] = leaf_text
+
+    min_occurrences = 2 if (len(sample_files) >= 2 and any(c >= 2 for c in sec_counts.values())) else 1
+    chosen_keys = [k for k, c in sec_counts.items() if c >= min_occurrences]
+    chosen_keys.sort(key=lambda k: (sum(sec_positions[k]) / len(sec_positions[k]), -sec_last_seen[k]))
+    ordered_sections = [sec_display[k] for k in chosen_keys]
+
+    section_children: dict[str, list[str]] = {}
+    task_leaf_by_section: dict[str, str] = {}
+    default_task_leaf: str | None = None
+    if global_task_leaf_counts:
+        top_leaf_k = global_task_leaf_counts.most_common(1)[0][0]
+        default_task_leaf = global_leaf_display[top_leaf_k]
+
+    for k in chosen_keys:
+        display_sec = sec_display[k]
+        c_counts = child_counts_by_sec.get(k, Counter())
+        if c_counts:
+            c_min = 2 if (sec_counts[k] >= 2 and any(c >= 2 for c in c_counts.values())) else 1
+            c_keys = [ck for ck, cnt in c_counts.items() if cnt >= c_min]
+            c_keys.sort(key=lambda ck: sum(child_order_by_sec[k][ck]) / len(child_order_by_sec[k][ck]))
+            section_children[display_sec] = [child_display_by_sec[k][ck] for ck in c_keys]
+        else:
+            section_children[display_sec] = []
+
+        sec_leaf_counts = task_leaf_counts_by_sec.get(k, Counter())
+        if sec_leaf_counts:
+            best_leaf_k = sec_leaf_counts.most_common(1)[0][0]
+            task_leaf_by_section[display_sec] = global_leaf_display.get(
+                best_leaf_k, child_display_by_sec[k].get(best_leaf_k, best_leaf_k)
+            )
+        elif default_task_leaf:
+            task_leaf_by_section[display_sec] = default_task_leaf
+
+    use_dividers = divider_files >= max(1, len(sample_files) // 2)
+    top_prefix = "#" * top_section_level
+    child_prefix = "#" * (top_section_level + 1)
+
+    tmpl_lines: list[str] = []
+    if title_line:
+        tmpl_lines.append(title_line)
+    for idx, sec in enumerate(ordered_sections):
+        if tmpl_lines:
+            tmpl_lines.append("")
+        if idx > 0 and use_dividers:
+            tmpl_lines.extend(["---", ""])
+        tmpl_lines.append(f"{top_prefix} {sec}")
+        for child in section_children.get(sec, []):
+            tmpl_lines.append(f"{child_prefix} {child}")
+            tmpl_lines.append("")
+        if tmpl_lines and tmpl_lines[-1] == "":
+            tmpl_lines.pop()
+
+    template_md = ("\n".join(tmpl_lines) + "\n") if tmpl_lines else ""
+
+    return {
+        "sample_size": len(sample_files),
+        "sampled_files": [str(p.relative_to(root)) for p in sample_files],
+        "title_mode": title_mode,
+        "title": title_line,
+        "top_section_level": top_section_level,
+        "sections": ordered_sections,
+        "section_children": section_children,
+        "task_leaf_by_section": task_leaf_by_section,
+        "default_task_leaf": default_task_leaf,
+        "use_dividers": use_dividers,
+        "template_markdown": template_md,
+    }
+
+
+def _iter_parsed_tasks(lines: list[str]) -> list[tuple[int, str, str, tuple[str, ...]]]:
+    """Yield (1-based line_no, state_char, raw_task_body, heading_path) for every task in lines."""
+    start = _body_start_index(lines)
+    active: dict[int, str] = {}
+    parsed: list[tuple[int, str, str, tuple[str, ...]]] = []
+
+    for idx in range(start, len(lines)):
+        line = lines[idx]
+        h = HEADING_RE.match(line)
+        if h:
+            lvl = len(h.group(1))
+            text = h.group(2).strip()
+            if lvl == 1 and PURE_DATE_TITLE_RE.match(text):
+                continue
+            active[lvl] = text
+            for deeper in [k for k in active if k > lvl]:
+                del active[deeper]
+            continue
+
+        m = TASK_LINE_RE.match(line)
+        if m:
+            path = tuple(active[k] for k in sorted(active))
+            parsed.append((idx + 1, m.group(2), m.group(3) or "", path))
+
+    return parsed
+
+
+def scan_open_tasks(root: Path, today_str: str) -> list[dict[str, object]]:
+    """Return deduplicated open tasks with first_seen date, full heading path, and in_today_note flag."""
     today_dt = datetime.strptime(today_str, "%Y-%m-%d").date()
-    tmpl = infer_note_template(root, sample_size)
-    sec_level = int(tmpl["section_level"])
     merged: dict[str, dict[str, object]] = {}
 
     for md_file in _iter_markdown_files(root):
         rel = str(md_file.relative_to(root))
         file_date = _note_date(md_file)
-        current_section = "Uncategorized"
+        lines = md_file.read_text(encoding="utf-8").splitlines()
 
-        for idx, line in enumerate(md_file.read_text(encoding="utf-8").splitlines(), start=1):
-            h = HEADING_RE.match(line)
-            if h:
-                lvl = len(h.group(1))
-                text = h.group(2).strip()
-                if lvl == sec_level:
-                    current_section = text
-                elif lvl < sec_level and not PURE_DATE_TITLE_RE.match(text) and current_section == "Uncategorized":
-                    current_section = text
+        for line_no, state_char, raw_body, path in _iter_parsed_tasks(lines):
+            if state_char != " ":
                 continue
-
-            m = TASK_OPEN_RE.match(line)
-            if not m:
-                continue
-
-            text, _ = _normalize_task_text(m.group(2))
+            text, _ = _normalize_task_text(raw_body)
             if not text:
                 continue
+
             key = text.lower()
             is_today = file_date >= today_str
+            top_section = path[0] if path else "Uncategorized"
+            sub_section = path[-1] if len(path) >= 2 else None
 
             if key not in merged:
                 merged[key] = {
                     "text": text,
-                    "section": current_section,
+                    "section": top_section,
+                    "sub_section": sub_section,
+                    "section_path": list(path),
                     "first_seen": file_date,
                     "first_file": rel,
                     "latest_file": rel,
-                    "line": idx,
+                    "line": line_no,
                     "in_today_note": is_today,
                 }
             else:
                 entry = merged[key]
                 entry["latest_file"] = rel
-                entry["line"] = idx
-                if current_section != "Uncategorized":
-                    entry["section"] = current_section
+                entry["line"] = line_no
+                if path:
+                    entry["section"] = top_section
+                    entry["sub_section"] = sub_section
+                    entry["section_path"] = list(path)
                 if file_date < str(entry["first_seen"]):
                     entry["first_seen"] = file_date
                     entry["first_file"] = rel
@@ -348,39 +480,18 @@ def scan_open_tasks(
     return results
 
 
-def build_task_lifecycle(
-    root: Path,
-    today_str: str,
-    sample_size: int = DEFAULT_SAMPLE_SIZE,
-) -> list[dict[str, object]]:
+def build_task_lifecycle(root: Path, today_str: str) -> list[dict[str, object]]:
     """Aggregate every task ([ ], [x], [>]) across all notes to track first_seen and done_date."""
     today_dt = datetime.strptime(today_str, "%Y-%m-%d").date()
-    tmpl = infer_note_template(root, sample_size)
-    sec_level = int(tmpl["section_level"])
     registry: dict[str, dict[str, object]] = {}
 
     for md_file in _iter_markdown_files(root):
         rel = str(md_file.relative_to(root))
         file_date = _note_date(md_file)
-        current_section = "Uncategorized"
+        lines = md_file.read_text(encoding="utf-8").splitlines()
 
-        for line in md_file.read_text(encoding="utf-8").splitlines():
-            h = HEADING_RE.match(line)
-            if h:
-                lvl = len(h.group(1))
-                text = h.group(2).strip()
-                if lvl == sec_level:
-                    current_section = text
-                elif lvl < sec_level and not PURE_DATE_TITLE_RE.match(text) and current_section == "Uncategorized":
-                    current_section = text
-                continue
-
-            m = TASK_LINE_RE.match(line)
-            if not m:
-                continue
-
-            state_char = m.group(2)
-            clean_text, stamped_done = _normalize_task_text(m.group(3))
+        for _, state_char, raw_body, path in _iter_parsed_tasks(lines):
+            clean_text, stamped_done = _normalize_task_text(raw_body)
             if not clean_text:
                 continue
 
@@ -388,11 +499,14 @@ def build_task_lifecycle(
             is_done = state_char in ("x", "X")
             is_open = state_char == " "
             resolved_done_date = (stamped_done or file_date) if is_done else None
+            top_section = path[0] if path else "Uncategorized"
+            sub_section = path[-1] if len(path) >= 2 else None
 
             if key not in registry:
                 registry[key] = {
                     "task": clean_text,
-                    "section": current_section,
+                    "section": top_section,
+                    "sub_section": sub_section,
                     "status": "done" if is_done else "open",
                     "first_seen": file_date,
                     "first_file": rel,
@@ -403,8 +517,9 @@ def build_task_lifecycle(
             else:
                 entry = registry[key]
                 entry["latest_file"] = rel
-                if current_section != "Uncategorized":
-                    entry["section"] = current_section
+                if path:
+                    entry["section"] = top_section
+                    entry["sub_section"] = sub_section
                 if file_date < str(entry["first_seen"]):
                     entry["first_seen"] = file_date
                     entry["first_file"] = rel
@@ -440,30 +555,83 @@ def _resolve_target_note(root: Path, now: datetime, sample_size: int = DEFAULT_S
         return sorted(today_matches)[-1]
 
     tmpl = infer_note_template(root, sample_size)
+    raw_md = str(tmpl["template_markdown"]).replace("{date}", now.strftime("%Y-%m-%d"))
     new_note = root / f"{now.strftime('%Y%m%d%H%M')}.md"
-    new_note.write_text(str(tmpl["template_markdown"]), encoding="utf-8")
+    new_note.write_text(raw_md, encoding="utf-8")
     return new_note
 
 
-def _is_section_boundary(line: str, section_level: int) -> bool:
-    if line.strip() == "---":
-        return True
-    h = HEADING_RE.match(line)
-    if h and len(h.group(1)) <= section_level:
-        return True
-    return False
+def _find_heading_span(
+    lines: list[str],
+    start_idx: int,
+    end_idx: int,
+    target_name: str,
+    preferred_level: int | None = None,
+) -> tuple[int, int, int] | None:
+    """Find best matching heading in [start_idx, end_idx); return (heading_idx, level, span_end_idx)."""
+    best_idx: int | None = None
+    best_level = preferred_level or 2
+    best_score = 0
+
+    for idx in range(start_idx, end_idx):
+        h = HEADING_RE.match(lines[idx])
+        if not h:
+            continue
+        lvl = len(h.group(1))
+        text = h.group(2).strip()
+        if lvl == 1 and PURE_DATE_TITLE_RE.match(text):
+            continue
+        score = _match_heading_name(text, target_name)
+        if score == 0:
+            continue
+        if preferred_level is not None and lvl == preferred_level:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+            best_level = lvl
+
+    if best_idx is None:
+        return None
+
+    span_end = best_idx + 1
+    while span_end < end_idx:
+        if lines[span_end].strip() == "---":
+            break
+        h = HEADING_RE.match(lines[span_end])
+        if h and len(h.group(1)) <= best_level:
+            break
+        span_end += 1
+
+    return best_idx, best_level, span_end
+
+
+def _insert_into_span(lines: list[str], span_start: int, span_end: int, new_line: str) -> None:
+    """Insert new_line at the end of [span_start, span_end), replacing an empty '- [ ]' placeholder if present."""
+    for idx in range(span_start, span_end):
+        m = TASK_OPEN_RE.match(lines[idx])
+        if m and not (m.group(2) or "").strip():
+            lines[idx] = new_line
+            return
+
+    insert_at = span_end
+    while insert_at > span_start and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+    lines.insert(insert_at, new_line)
 
 
 def _insert_task_into_note(
     target: Path,
     task_text: str,
     section: str | None,
+    sub_section: str | None,
     tmpl: dict[str, object],
 ) -> tuple[str, str]:
     lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
     rel_target = str(target.relative_to(NOTES_DIR)) if target.is_relative_to(NOTES_DIR) else str(target)
+    body_start = _body_start_index(lines)
 
-    for line in lines:
+    for line in lines[body_start:]:
         m_any = TASK_LINE_RE.match(line)
         if m_any:
             existing_clean, _ = _normalize_task_text(m_any.group(3))
@@ -471,72 +639,89 @@ def _insert_task_into_note(
                 return "skipped_duplicate_in_target_note", rel_target
 
     new_line = f"- [ ] {task_text}"
-    default_sec_level = int(tmpl["section_level"])
+    top_level = int(tmpl["top_section_level"])
     template_sections = [str(s) for s in list(tmpl["sections"])]
+    section_children: dict[str, list[str]] = tmpl["section_children"]  # type: ignore[assignment]
+    task_leaf_by_section: dict[str, str] = tmpl["task_leaf_by_section"]  # type: ignore[assignment]
+    default_task_leaf = str(tmpl["default_task_leaf"]) if tmpl["default_task_leaf"] else None
+    use_dividers = bool(tmpl["use_dividers"])
 
     if section and section != "Uncategorized":
-        # Find best matching heading in target (exact match preferred over prefix match)
-        best_idx: int | None = None
-        best_level: int = default_sec_level
-        best_score = 0
+        canonical_sec = next(
+            (s for s in template_sections if _match_heading_name(s, section) > 0),
+            section.strip(),
+        )
+        desired_leaf = sub_section or task_leaf_by_section.get(canonical_sec) or default_task_leaf
 
-        for idx, line in enumerate(lines):
-            h = HEADING_RE.match(line)
-            if not h:
-                continue
-            score = _match_heading_name(h.group(2), section)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-                best_level = len(h.group(1))
-
-        if best_idx is not None:
-            insert_idx = best_idx + 1
-            while insert_idx < len(lines) and not _is_section_boundary(lines[insert_idx], best_level):
-                insert_idx += 1
-            while insert_idx > best_idx + 1 and lines[insert_idx - 1].strip() == "":
-                insert_idx -= 1
-            lines.insert(insert_idx, new_line)
+        top_span = _find_heading_span(lines, body_start, len(lines), canonical_sec, preferred_level=top_level)
+        if top_span is not None:
+            top_idx, found_top_lvl, top_end = top_span
+            if desired_leaf:
+                leaf_span = _find_heading_span(
+                    lines, top_idx + 1, top_end, desired_leaf, preferred_level=found_top_lvl + 1
+                )
+                if leaf_span is not None:
+                    leaf_idx, _, leaf_end = leaf_span
+                    _insert_into_span(lines, leaf_idx + 1, leaf_end, new_line)
+                else:
+                    # Parent section exists in target, but task subheading does not yet
+                    leaf_heading = f"{'#' * (found_top_lvl + 1)} {desired_leaf}"
+                    insert_at = top_end
+                    while insert_at > top_idx + 1 and lines[insert_at - 1].strip() == "":
+                        insert_at -= 1
+                    block = (["", leaf_heading, new_line] if insert_at > top_idx + 1 else [leaf_heading, new_line])
+                    lines[insert_at:insert_at] = block
+            else:
+                _insert_into_span(lines, top_idx + 1, top_end, new_line)
         else:
-            # Section does not exist in target yet: insert it in the inferred template order
-            canonical_name = next(
-                (s for s in template_sections if _match_heading_name(s, section) > 0),
-                section.strip(),
-            )
-            heading_line = f"{'#' * default_sec_level} {canonical_name}"
+            # Top-level section is missing from target: build full section skeleton in template order
+            top_heading = f"{'#' * top_level} {canonical_sec}"
+            child_heading_lvl = top_level + 1
+            children = list(section_children.get(canonical_sec, []))
+            if desired_leaf and not any(_match_heading_name(c, desired_leaf) > 0 for c in children):
+                children.append(desired_leaf)
 
-            # Determine which template sections come after canonical_name
+            sec_block: list[str] = [top_heading]
+            if children:
+                for child in children:
+                    sec_block.append(f"{'#' * child_heading_lvl} {child}")
+                    if desired_leaf and _match_heading_name(child, desired_leaf) > 0:
+                        sec_block.append(new_line)
+                    sec_block.append("")
+                if sec_block[-1] == "":
+                    sec_block.pop()
+            else:
+                sec_block.append(new_line)
+
             after_sections: list[str] = []
             for i, s in enumerate(template_sections):
-                if s.lower() == canonical_name.lower():
+                if s.lower() == canonical_sec.lower():
                     after_sections = template_sections[i + 1 :]
                     break
 
             insert_heading_at: int | None = None
             if after_sections:
-                for idx, line in enumerate(lines):
-                    h = HEADING_RE.match(line)
-                    if h and len(h.group(1)) == default_sec_level:
+                for idx in range(body_start, len(lines)):
+                    h = HEADING_RE.match(lines[idx])
+                    if h and len(h.group(1)) == top_level:
                         if any(_match_heading_name(h.group(2), nxt) > 0 for nxt in after_sections):
                             insert_heading_at = idx
+                            if use_dividers and insert_heading_at >= 2 and lines[insert_heading_at - 2].strip() == "---":
+                                insert_heading_at -= 2
                             break
 
             if insert_heading_at is not None:
-                block = [heading_line, new_line, ""]
-                lines[insert_heading_at:insert_heading_at] = block
-            elif lines and lines[-1].strip() == "---":
-                pos = len(lines) - 1
-                block = (["", heading_line, new_line] if pos > 0 and lines[pos - 1].strip() != "" else [heading_line, new_line])
-                lines[pos:pos] = block
+                prefix = ["---", ""] if (use_dividers and insert_heading_at > body_start) else []
+                suffix = ["", "---", ""] if use_dividers else [""]
+                lines[insert_heading_at:insert_heading_at] = prefix + sec_block + suffix
             else:
                 if lines and lines[-1].strip() != "":
                     lines.append("")
-                lines.extend([heading_line, new_line])
+                if use_dividers and any(HEADING_RE.match(l) for l in lines[body_start:]):
+                    lines.extend(["---", ""])
+                lines.extend(sec_block)
     else:
-        if lines and lines[-1].strip() == "---":
-            lines.insert(len(lines) - 1, new_line)
-        else:
-            lines.append(new_line)
+        _insert_into_span(lines, body_start, len(lines), new_line)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -585,7 +770,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
             "/calendar/events",
             {"days_behind": args.behind, "days_ahead": args.days},
         )
-        open_notes = scan_open_tasks(NOTES_DIR, today_str, args.sample_notes)
+        open_notes = scan_open_tasks(NOTES_DIR, today_str)
         trello_cards = fut_trello.result()
         cal_events = fut_cal.result()
 
@@ -612,7 +797,7 @@ def cmd_summarize(args: argparse.Namespace) -> None:
     today_str = now.strftime("%Y-%m-%d")
     today_dt = now.date()
 
-    items = build_task_lifecycle(NOTES_DIR, today_str, args.sample_notes)
+    items = build_task_lifecycle(NOTES_DIR, today_str)
 
     if args.status != "all":
         items = [i for i in items if i["status"] == args.status]
@@ -680,13 +865,14 @@ def cmd_notes_add(args: argparse.Namespace) -> None:
     if not target.is_absolute():
         target = NOTES_DIR / target
 
-    status, rel_target = _insert_task_into_note(target, task_text, args.section, tmpl)
+    status, rel_target = _insert_task_into_note(target, task_text, args.section, args.sub_section, tmpl)
     print(
         json.dumps(
             {
                 "status": status,
                 "file": rel_target,
                 "section": args.section or "End of file",
+                "sub_section": args.sub_section,
                 "line": f"- [ ] {task_text}",
             },
             ensure_ascii=False,
@@ -704,7 +890,7 @@ def cmd_notes_rollover(args: argparse.Namespace) -> None:
     tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
     target = _resolve_target_note(NOTES_DIR, now, args.sample_notes)
 
-    open_tasks = scan_open_tasks(NOTES_DIR, today_str, args.sample_notes)
+    open_tasks = scan_open_tasks(NOTES_DIR, today_str)
     matches = [
         t
         for t in open_tasks
@@ -720,7 +906,8 @@ def cmd_notes_rollover(args: argparse.Namespace) -> None:
     item = matches[0]
     task_text = str(item["text"])
     section = args.section or (str(item["section"]) if item["section"] != "Uncategorized" else None)
-    status, rel_target = _insert_task_into_note(target, task_text, section, tmpl)
+    sub_section = str(item["sub_section"]) if item["sub_section"] else None
+    status, rel_target = _insert_task_into_note(target, task_text, section, sub_section, tmpl)
     forwarded_from = _mark_forwarded_in_older_notes(NOTES_DIR, task_text.lower(), target)
 
     print(
@@ -729,6 +916,7 @@ def cmd_notes_rollover(args: argparse.Namespace) -> None:
                 "status": "rolled_over" if status == "added" else status,
                 "to_file": rel_target,
                 "section": section or "End of file",
+                "sub_section": sub_section,
                 "task": task_text,
                 "first_seen": item["first_seen"],
                 "forwarded_from": forwarded_from,
@@ -739,7 +927,7 @@ def cmd_notes_rollover(args: argparse.Namespace) -> None:
 
 
 def cmd_notes_rollover_all(args: argparse.Namespace) -> None:
-    """Roll over every open task missing from today's note into its original section."""
+    """Roll over every open task missing from today's note into its original section path."""
     now = _local_now()
     today_str = now.strftime("%Y-%m-%d")
     today_notes = _find_today_notes(NOTES_DIR, now)
@@ -758,7 +946,7 @@ def cmd_notes_rollover_all(args: argparse.Namespace) -> None:
         return
 
     tmpl = infer_note_template(NOTES_DIR, args.sample_notes)
-    open_tasks = scan_open_tasks(NOTES_DIR, today_str, args.sample_notes)
+    open_tasks = scan_open_tasks(NOTES_DIR, today_str)
     missing = [t for t in open_tasks if not bool(t["in_today_note"])]
     if not missing:
         print(
@@ -778,13 +966,15 @@ def cmd_notes_rollover_all(args: argparse.Namespace) -> None:
     for item in missing:
         task_text = str(item["text"])
         section = str(item["section"]) if item["section"] != "Uncategorized" else None
-        status, rel_target = _insert_task_into_note(target, task_text, section, tmpl)
+        sub_section = str(item["sub_section"]) if item["sub_section"] else None
+        status, _ = _insert_task_into_note(target, task_text, section, sub_section, tmpl)
         forwarded_from = _mark_forwarded_in_older_notes(NOTES_DIR, task_text.lower(), target)
         rolled.append(
             {
                 "status": "rolled_over" if status == "added" else status,
                 "task": task_text,
                 "section": section or "End of file",
+                "sub_section": sub_section,
                 "first_seen": item["first_seen"],
                 "forwarded_from": forwarded_from,
             }
@@ -818,7 +1008,7 @@ def cmd_notes_done(args: argparse.Namespace) -> None:
             if not m:
                 continue
             clean_body, _ = _normalize_task_text(m.group(2))
-            if needle_lower in clean_body.lower():
+            if clean_body and needle_lower in clean_body.lower():
                 grouped.setdefault(clean_body.lower(), []).append((md_file, idx, line, clean_body))
 
     if not grouped:
@@ -933,7 +1123,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum.add_argument("--status", choices=["all", "open", "done"], default="all", help="Filter by status")
     p_sum.add_argument("--section", default=None, help="Filter by section heading")
     p_sum.add_argument("--days", type=int, default=None, help="Only tasks active/done in the last N days")
-    p_sum.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer sections")
     p_sum.add_argument("--md", action="store_true", help="Output formatted Markdown instead of JSON")
     p_sum.set_defaults(func=cmd_summarize)
 
@@ -947,20 +1136,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_n_add = notes_sub.add_parser("add", help="Add an open task (- [ ]) to today's note")
     p_n_add.add_argument("text", help="Task description")
-    p_n_add.add_argument("--section", help="Target section heading")
+    p_n_add.add_argument("--section", help="Target top-level section heading (e.g. Work, Personal, APyB)")
+    p_n_add.add_argument("--sub-section", default=None, help="Optional nested task heading (defaults to inferred leaf)")
     p_n_add.add_argument("--file", help="Specific target note relative to NOTES_DIR")
     p_n_add.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer template")
     p_n_add.set_defaults(func=cmd_notes_add)
 
     p_n_roll = notes_sub.add_parser("rollover", help="Bring a single open task from an earlier note into today's note")
     p_n_roll.add_argument("match", help="Unique substring matching the task text")
-    p_n_roll.add_argument("--section", help="Target section heading (defaults to original section)")
+    p_n_roll.add_argument("--section", help="Target top-level section heading (defaults to original section)")
     p_n_roll.add_argument("--sample-notes", type=int, default=DEFAULT_SAMPLE_SIZE, help="Recent notes to infer template")
     p_n_roll.set_defaults(func=cmd_notes_rollover)
 
     p_n_roll_all = notes_sub.add_parser(
         "rollover-all",
-        help="Roll over all open tasks missing from today's note into their original sections",
+        help="Roll over all open tasks missing from today's note into their original section paths",
     )
     p_n_roll_all.add_argument(
         "--only-if-today-exists",
