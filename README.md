@@ -4,7 +4,7 @@ Lightweight FastAPI bridge and CLI wrapper that connects a local **Hermes Agent*
 
 ## Architecture
 
-- **`server.py`**: FastAPI service running on `glass` (`0.0.0.0:8765` via `systemd` user service) over your Tailscale/LAN network.
+- **`server.py`**: FastAPI service running (`0.0.0.0:8765` via `systemd` user service).
   - Authenticates against Google Calendar using a local Google Cloud **Service Account** (`service-account.json`).
   - Merges events across all calendars defined in `CALENDAR_IDS` on `GET /calendar/events`, tagging each event with its calendar label.
   - Creates, updates, and deletes events on `CALENDAR_ID` (or the first calendar in `CALENDAR_IDS` if `CALENDAR_ID` is omitted).
@@ -15,7 +15,6 @@ Lightweight FastAPI bridge and CLI wrapper that connects a local **Hermes Agent*
 
 ### 1. Install Dependencies (`uv`)
 
-    cd ~/gits/personal-api
     uv sync
     # Or add core packages explicitly:
     uv add fastapi uvicorn httpx python-dotenv google-api-python-client google-auth pydantic
@@ -39,7 +38,7 @@ Create `~/gits/personal-api/.env` (`chmod 600`):
     API_TOKEN=your-strong-random-bearer-token
 
     # Google Calendar
-    GOOGLE_APPLICATION_CREDENTIALS=/home/zsinx6/gits/personal-api/service-account.json
+    GOOGLE_APPLICATION_CREDENTIALS=/path/to/personal-api/service-account.json
     CALENDAR_ID=your.personal@gmail.com
     CALENDAR_IDS=Personal:your.personal@gmail.com,Work:your.work@company.com,Holidays:pt.brazilian#holiday@group.v.calendar.google.com
 
@@ -60,8 +59,8 @@ Unit file (`~/.config/systemd/user/personal-api.service`):
 
     [Service]
     Type=simple
-    WorkingDirectory=/home/zsinx6/gits/personal-api
-    ExecStart=/home/zsinx6/.local/bin/uv run uvicorn server:app --host 0.0.0.0 --port 8765
+    WorkingDirectory=/path/to/personal-api
+    ExecStart=/home/user/.local/bin/uv run uvicorn server:app --host 0.0.0.0 --port 8765
     Restart=always
     RestartSec=3
 
@@ -76,7 +75,7 @@ Enable and verify:
 
 ## CLI Usage (`cli.py`)
 
-`cli.py` reads `API_URL` (e.g., `http://192.168.50.168:8765`) and `API_TOKEN` from `/opt/data/personal-api/.env`.
+`cli.py` reads `API_URL` (e.g., `http://192.168.1.10:8765`) and `API_TOKEN` from `/opt/data/personal-api/.env`.
 
 ### Google Calendar
 
