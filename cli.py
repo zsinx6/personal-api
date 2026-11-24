@@ -18,7 +18,9 @@ ENV_PATH = Path(os.environ.get("PERSONAL_API_ENV", "/opt/data/personal-api/.env"
 NOTES_DIR = Path(os.environ.get("NOTES_DIR", "/opt/data/notes"))
 
 TASK_OPEN_RE = re.compile(r"^(\s*-\s*)\[\s\](\s+.*)$")
-HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
+TASK_ANY_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s+(.*)$")
+LEADING_CHECKBOX_RE = re.compile(r"^(?:[-*]\s*\[[ xX]\]\s*|[-*]\s+)")
+HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
 DATE_PREFIX_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})")
 ISO_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
@@ -43,7 +45,9 @@ def api_request(
     payload: dict[str, object] | None = None,
 ) -> object:
     cfg = load_env(ENV_PATH)
-    base_url = (os.environ.get("API_URL") or cfg.get("API_URL") or "http://192.168.50.168:8765").rstrip("/")
+    base_url = (
+        os.environ.get("API_URL") or cfg.get("API_URL")
+    ).rstrip("/")
     token = (
         os.environ.get("API_TOKEN")
         or cfg.get("API_TOKEN")
@@ -110,7 +114,7 @@ def scan_open_tasks(root: Path, today_str: str) -> list[dict[str, object]]:
         for idx, line in enumerate(md_file.read_text(encoding="utf-8").splitlines(), start=1):
             h = HEADING_RE.match(line)
             if h:
-                current_section = h.group(1)
+                current_section = h.group(2)
                 continue
             m = TASK_OPEN_RE.match(line)
             if m:
@@ -141,12 +145,23 @@ def _resolve_target_note(root: Path, now: datetime) -> Path:
     if today_matches:
         return sorted(today_matches)[-1]
 
-    if candidates:
-        return sorted(candidates)[-1]
-
     new_note = root / f"{now.strftime('%Y%m%d%H%M')}.md"
     new_note.write_text("# Daily Notes\n\n## Work\n\n## APyB\n\n## Personal\n", encoding="utf-8")
     return new_note
+
+
+def _is_section_boundary(line: str, section_level: int) -> bool:
+    if line.strip() == "---":
+        return True
+    h = HEADING_RE.match(line)
+    if h and len(h.group(1)) <= section_level:
+        return True
+    return False
+
+
+def _matches_section(heading_text: str, target_lower: str) -> bool:
+    clean = heading_text.strip().lower()
+    return clean == target_lower or clean.startswith(f"{target_lower} ") or clean.startswith(f"{target_lower}(")
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
@@ -182,9 +197,12 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
 def cmd_notes_add(args: argparse.Namespace) -> None:
     now = datetime.now(TZ_SP)
-    task_text = args.text.strip()
-    existing = scan_open_tasks(NOTES_DIR, now.strftime("%Y-%m-%d"))
-    if any(t["text"].lower() == task_text.lower() for t in existing):
+    task_text = LEADING_CHECKBOX_RE.sub("", args.text.strip()).strip()
+    if not task_text:
+        raise RuntimeError("Task text cannot be empty")
+
+    existing_open = scan_open_tasks(NOTES_DIR, now.strftime("%Y-%m-%d"))
+    if any(str(t["text"]).lower() == task_text.lower() for t in existing_open):
         print(json.dumps({"status": "skipped_duplicate", "text": task_text}, ensure_ascii=False))
         return
 
@@ -193,6 +211,13 @@ def cmd_notes_add(args: argparse.Namespace) -> None:
         target = NOTES_DIR / target
 
     lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+
+    for line in lines:
+        m_any = TASK_ANY_RE.match(line)
+        if m_any and m_any.group(1).strip().lower() == task_text.lower():
+            print(json.dumps({"status": "skipped_duplicate_in_note", "text": task_text}, ensure_ascii=False))
+            return
+
     new_line = f"- [ ] {task_text}"
 
     if args.section:
@@ -200,9 +225,10 @@ def cmd_notes_add(args: argparse.Namespace) -> None:
         insert_idx: int | None = None
         for idx, line in enumerate(lines):
             h = HEADING_RE.match(line)
-            if h and h.group(1).strip().lower() == section_lower:
+            if h and len(h.group(1)) >= 2 and _matches_section(h.group(2), section_lower):
+                sec_level = len(h.group(1))
                 insert_idx = idx + 1
-                while insert_idx < len(lines) and not lines[insert_idx].startswith("## "):
+                while insert_idx < len(lines) and not _is_section_boundary(lines[insert_idx], sec_level):
                     insert_idx += 1
                 while insert_idx > idx + 1 and lines[insert_idx - 1].strip() == "":
                     insert_idx -= 1
@@ -214,8 +240,12 @@ def cmd_notes_add(args: argparse.Namespace) -> None:
                 lines.append("")
             lines.extend([f"## {args.section.strip()}", new_line])
     else:
-        lines.append(new_line)
+        if lines and lines[-1].strip() == "---":
+            lines.insert(len(lines) - 1, new_line)
+        else:
+            lines.append(new_line)
 
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(
         json.dumps(
@@ -231,7 +261,7 @@ def cmd_notes_add(args: argparse.Namespace) -> None:
 
 
 def cmd_notes_done(args: argparse.Namespace) -> None:
-    needle = args.match.strip().lower()
+    needle = LEADING_CHECKBOX_RE.sub("", args.match.strip()).strip().lower()
     matches: list[tuple[Path, int, str]] = []
 
     for md_file in _iter_markdown_files(NOTES_DIR):
